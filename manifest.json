@@ -1,0 +1,15 @@
+{
+  "name": "VDrop — Быстрый буфер и чат",
+  "short_name": "VDrop",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#090d16",
+  "theme_color": "#090d16",
+  "icons": [
+    {
+      "src": "photo_2026-08-10_21-18-37.jpg",
+      "sizes": "512x512",
+      "type": "image/jpeg"
+    }
+  ]
+}
