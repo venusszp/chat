@@ -277,21 +277,14 @@
     </div>
   </div>
 
-  <!-- Firebase & App Script (ES Module) -->
+  <!-- App Script -->
   <script type="module">
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-    import { 
-      getDatabase, 
-      ref, 
-      push, 
-      onValue, 
-      remove 
-    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
-
-    // App State & Database
-    let app = null;
-    let db = null;
-    let messagesRef = null;
+    let chatReady = false;
+    let chatSecret = localStorage.getItem("vdrop_secret") || "";
+    let refreshInProgress = false;
+    let refreshTimer;
+    let feedJson;
+    let revision = 0;
     let messages = [];
     let isSending = false;
     let isDeleting = false;
@@ -304,35 +297,24 @@
       localStorage.setItem("cd_anon_name", myAnonName);
     }
 
-    // Dynamic Config Loader (from Vercel Environment Variables / Serverless API)
-    async function fetchAppConfig() {
-      let storedSecret = localStorage.getItem("vdrop_secret") || "";
-      let res = null;
-      try {
-        res = await fetch("/api/config", {
-          headers: storedSecret ? { "x-chat-secret": storedSecret } : {},
-          signal: AbortSignal.timeout(10000)
-        });
-      } catch (e) {
-        console.warn("API config fetch warning:", e);
+    async function chatRequest(method = "GET", id, message) {
+      const url = id === undefined ? "/api/messages" : "/api/messages?id=" + encodeURIComponent(id);
+      const response = await fetch(url, {
+        method,
+        cache: "no-store",
+        headers: { "x-chat-secret": chatSecret, "Content-Type": "application/json" },
+        body: message === undefined ? undefined : JSON.stringify(message),
+        signal: AbortSignal.timeout(12000)
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        const error = new Error(body.error || "Не удалось связаться с сервером чата.");
+        error.status = response.status;
+        throw error;
       }
-
-      if (res && res.ok) {
-        let data = await res.json();
-        if (data.protected && !data.authenticated) {
-          const pass = prompt("🔒 Чат защищен паролем.\nВведите секретный ключ доступа:");
-          if (pass) {
-            localStorage.setItem("vdrop_secret", pass.trim());
-            return fetchAppConfig();
-          } else {
-            return null;
-          }
-        }
-        if (data.apiKey) return data;
-      }
-      return null;
+      return method === "GET" ? response.text() : undefined;
     }
-    
+
     // UI Elements
     const elements = {
       feedContainer: document.getElementById("feed-container"),
@@ -421,67 +403,69 @@
       }
     }
 
-    // Wait for the first database snapshot before enabling writes.
-    async function initFirebaseAndApp() {
-      elements.anonBadge.innerText = `Вы: ${myAnonName}`;
-      setAppStatus("checking");
-      lucide.createIcons();
-      elements.btnSend.disabled = true;
-
+    async function refreshChat(promptForSecret = false) {
+      if (refreshInProgress) return;
+      clearTimeout(refreshTimer);
+      refreshInProgress = true;
+      const observedRevision = revision;
+      let shouldRetry = true;
       try {
-        const config = await fetchAppConfig();
-        if (config && config.apiKey) {
-          app = initializeApp(config);
-          db = getDatabase(app);
-          const chatRef = ref(db, "chat_snippets");
-
-          const connectionTimeout = setTimeout(() => {
-            setAppStatus("error");
-            showFirebaseWarning("Firebase не ответил. Проверьте подключение к сети.");
-          }, 10000);
-
-          onValue(chatRef, (snapshot) => {
-            if (!messagesRef) {
-              clearTimeout(connectionTimeout);
-              elements.firebaseErrorAlert.style.display = "none";
-              messagesRef = chatRef;
-              elements.btnSend.disabled = false;
-              setAppStatus("ready");
-            } else if (!isSending && !isDeleting) {
-              setAppStatus("reading", 700);
-            }
-            const val = snapshot.val();
-            if (val) {
-              messages = Object.keys(val).map(key => ({
-                id: key,
-                ...val[key]
-              }));
-            } else {
-              messages = [];
-            }
-            renderMessages();
-            scrollToBottom();
-          }, (error) => {
-            clearTimeout(connectionTimeout);
-            console.error("Firebase sync error:", error);
-            setAppStatus("error");
-            messagesRef = null;
-            elements.btnSend.disabled = true;
-            showFirebaseWarning(error.code === "PERMISSION_DENIED"
-              ? "Firebase отклонил доступ к сообщениям. Обратитесь к владельцу чата."
-              : "Не удалось загрузить сообщения из Firebase.");
-          });
-        } else {
-          setAppStatus("error");
-          showFirebaseWarning("Конфигурация Firebase не загружена. Проверьте переменные окружения на Vercel или локальный .env файл.");
+        let snapshot;
+        while (snapshot === undefined) {
+          try {
+            snapshot = await chatRequest();
+          } catch (error) {
+            if (error.status !== 401 || !promptForSecret) throw error;
+            const entered = prompt("Введите ключ доступа к чату:");
+            if (!entered?.trim()) throw error;
+            chatSecret = entered.trim();
+          }
         }
-      } catch (err) {
-        console.error("Firebase init error:", err);
+
+        if (observedRevision !== revision) return;
+        if (promptForSecret && chatSecret) localStorage.setItem("vdrop_secret", chatSecret);
+        const nextMessages = snapshot === feedJson ? null : JSON.parse(snapshot);
+        if (nextMessages !== null && !Array.isArray(nextMessages)) {
+          throw new Error("Сервер вернул некорректный список сообщений.");
+        }
+        if (!chatReady) {
+          chatReady = true;
+          elements.btnSend.disabled = isSending;
+          setAppStatus("ready");
+        }
+        elements.firebaseErrorAlert.style.display = "none";
+        if (nextMessages !== null) {
+          messages = nextMessages;
+          feedJson = snapshot;
+          renderMessages();
+          scrollToBottom();
+        }
+      } catch (error) {
+        if (observedRevision !== revision) return;
+        shouldRetry = error.status !== 401 && error.status !== 503;
+        chatReady = false;
+        elements.btnSend.disabled = true;
         setAppStatus("error");
-        showFirebaseWarning(err.message);
+        showFirebaseWarning(error.status === 401
+          ? "Для доступа к чату обновите страницу и введите ключ."
+          : error.message);
+      } finally {
+        refreshInProgress = false;
+        if (shouldRetry) {
+          refreshTimer = setTimeout(refreshChat,
+            observedRevision !== revision ? 0 : (document.hidden ? 30000 : 5000));
+        }
       }
     }
-    initFirebaseAndApp();
+
+    elements.anonBadge.innerText = `Вы: ${myAnonName}`;
+    setAppStatus("checking");
+    lucide.createIcons();
+    elements.btnSend.disabled = true;
+    refreshChat(true);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) refreshChat();
+    });
 
     // Auto-resize input textarea
     function autoResizeTextarea() {
@@ -666,8 +650,9 @@
 
     // Send Message
     async function sendMessage() {
-      const content = elements.messageInput.value.trim();
-      if (!content || !messagesRef || isSending) return;
+      const draft = elements.messageInput.value;
+      const content = draft.trim();
+      if (!content || !chatReady || isSending) return;
 
       const isCode = isLikelyCode(content);
       const newMsg = {
@@ -683,26 +668,30 @@
       const startTime = Date.now();
 
       try {
-        await push(messagesRef, newMsg);
-        elements.messageInput.value = "";
-        autoResizeTextarea();
+        await chatRequest("POST", undefined, newMsg);
+        revision++;
+        refreshChat();
+        if (elements.messageInput.value === draft) {
+          elements.messageInput.value = "";
+          autoResizeTextarea();
+        }
         showToast("Отправлено!", isCode ? "Сниппет кода сохранен" : "Сообщение доставлено", "success");
 
         // Guarantee that 'sending...' is clearly visible (minimum 400ms) before flipping to 'sent!'
         const elapsed = Date.now() - startTime;
         const delay = Math.max(0, 400 - elapsed);
         setTimeout(() => {
-          setAppStatus("sent", 700);
+          if (chatReady) setAppStatus("sent", 700);
           isSending = false;
+          elements.btnSend.disabled = !chatReady;
         }, delay);
       } catch (err) {
         console.error("Error sending message:", err);
-        showToast("Ошибка отправки", "Проверьте правила доступа в Firebase", "error");
-        showFirebaseWarning(err.message);
+        showToast("Ошибка отправки", err.message, "error");
         setAppStatus("error");
         isSending = false;
       } finally {
-        elements.btnSend.disabled = !messagesRef;
+        elements.btnSend.disabled = !chatReady || isSending;
         elements.messageInput.focus();
       }
     }
@@ -789,26 +778,27 @@
         isDanger: true
       });
 
-      if (!confirmed) return;
+      if (!confirmed || !chatReady || isDeleting) return;
 
       isDeleting = true;
       setAppStatus("deleting");
       const startTime = Date.now();
 
       try {
-        const itemRef = ref(db, `chat_snippets/${id}`);
-        await remove(itemRef);
+        await chatRequest("DELETE", id);
+        revision++;
+        refreshChat();
         showToast("Удалено", "Сообщение успешно удалено", "info");
 
         const elapsed = Date.now() - startTime;
         const delay = Math.max(0, 400 - elapsed);
         setTimeout(() => {
-          setAppStatus("ready");
+          if (chatReady) setAppStatus("ready");
           isDeleting = false;
         }, delay);
       } catch (err) {
         console.error("Delete failed:", err);
-        showToast("Ошибка", "Не удалось удалить сообщение", "error");
+        showToast("Ошибка удаления", err.message, "error");
         setAppStatus("error");
         isDeleting = false;
       }
@@ -825,25 +815,27 @@
         isDanger: true
       });
 
-      if (!confirmed) return;
+      if (!confirmed || !chatReady || isDeleting) return;
 
       isDeleting = true;
       setAppStatus("deleting");
       const startTime = Date.now();
 
       try {
-        await remove(messagesRef);
+        await chatRequest("DELETE");
+        revision++;
+        refreshChat();
         showToast("Очищено", "Все сообщения были удалены", "info");
 
         const elapsed = Date.now() - startTime;
         const delay = Math.max(0, 400 - elapsed);
         setTimeout(() => {
-          setAppStatus("ready");
+          if (chatReady) setAppStatus("ready");
           isDeleting = false;
         }, delay);
       } catch (err) {
         console.error("Clear all failed:", err);
-        showToast("Ошибка", "Не удалось очистить сообщения", "error");
+        showToast("Ошибка очистки", err.message, "error");
         setAppStatus("error");
         isDeleting = false;
       }
