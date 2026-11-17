@@ -167,16 +167,13 @@
     </div>
   </header>
 
-  <!-- Firebase Rules Warning Modal / Alert (hidden by default) -->
-  <div id="firebase-error-alert" class="shrink-0 max-w-4xl mx-auto w-full px-4 mt-2" style="display: none;">
+  <!-- Firebase error alert (hidden by default) -->
+  <div id="firebase-error-alert" role="alert" class="shrink-0 max-w-4xl mx-auto w-full px-4 mt-2" style="display: none;">
     <div class="p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-sm flex items-start gap-3">
       <i data-lucide="alert-triangle" class="w-5 h-5 text-amber-400 shrink-0 mt-0.5"></i>
       <div class="space-y-1">
-        <h4 class="font-semibold text-amber-300">Внимание: Нет доступа к базе Firebase</h4>
-        <p class="text-xs text-amber-200/80 leading-relaxed">
-          Если сообщения не сохраняются, перейдите в <b>Firebase Console → Realtime Database → вкладка "Правила" (Rules)</b> и укажите:
-        </p>
-        <pre class="bg-black/40 p-2 rounded text-xs font-mono text-amber-100 overflow-x-auto">{ "rules": { ".read": true, ".write": true } }</pre>
+        <h4 class="font-semibold text-amber-300">Ошибка подключения к чату</h4>
+        <p id="firebase-error-details" class="text-xs text-amber-200/80 leading-relaxed"></p>
       </div>
     </div>
   </div>
@@ -296,7 +293,6 @@
     let db = null;
     let messagesRef = null;
     let messages = [];
-    let isChecking = true;
     let isSending = false;
     let isDeleting = false;
     let statusTimer = null;
@@ -314,7 +310,8 @@
       let res = null;
       try {
         res = await fetch("/api/config", {
-          headers: storedSecret ? { "x-chat-secret": storedSecret } : {}
+          headers: storedSecret ? { "x-chat-secret": storedSecret } : {},
+          signal: AbortSignal.timeout(10000)
         });
       } catch (e) {
         console.warn("API config fetch warning:", e);
@@ -424,22 +421,33 @@
       }
     }
 
-    // Initialize UI & Firebase (Holding 'checking...' for 1 second)
+    // Wait for the first database snapshot before enabling writes.
     async function initFirebaseAndApp() {
       elements.anonBadge.innerText = `Вы: ${myAnonName}`;
       setAppStatus("checking");
       lucide.createIcons();
-      const startTime = Date.now();
+      elements.btnSend.disabled = true;
 
       try {
         const config = await fetchAppConfig();
         if (config && config.apiKey) {
           app = initializeApp(config);
           db = getDatabase(app);
-          messagesRef = ref(db, "chat_snippets");
+          const chatRef = ref(db, "chat_snippets");
 
-          onValue(messagesRef, (snapshot) => {
-            if (!isChecking && !isSending && !isDeleting) {
+          const connectionTimeout = setTimeout(() => {
+            setAppStatus("error");
+            showFirebaseWarning("Firebase не ответил. Проверьте подключение к сети.");
+          }, 10000);
+
+          onValue(chatRef, (snapshot) => {
+            if (!messagesRef) {
+              clearTimeout(connectionTimeout);
+              elements.firebaseErrorAlert.style.display = "none";
+              messagesRef = chatRef;
+              elements.btnSend.disabled = false;
+              setAppStatus("ready");
+            } else if (!isSending && !isDeleting) {
               setAppStatus("reading", 700);
             }
             const val = snapshot.val();
@@ -454,9 +462,14 @@
             renderMessages();
             scrollToBottom();
           }, (error) => {
+            clearTimeout(connectionTimeout);
             console.error("Firebase sync error:", error);
             setAppStatus("error");
-            showFirebaseWarning(error.message);
+            messagesRef = null;
+            elements.btnSend.disabled = true;
+            showFirebaseWarning(error.code === "PERMISSION_DENIED"
+              ? "Firebase отклонил доступ к сообщениям. Обратитесь к владельцу чата."
+              : "Не удалось загрузить сообщения из Firebase.");
           });
         } else {
           setAppStatus("error");
@@ -466,15 +479,6 @@
         console.error("Firebase init error:", err);
         setAppStatus("error");
         showFirebaseWarning(err.message);
-      } finally {
-        const elapsed = Date.now() - startTime;
-        const remainingDelay = Math.max(0, 1000 - elapsed);
-        setTimeout(() => {
-          isChecking = false;
-          if (!isSending && !isDeleting && messagesRef) {
-            setAppStatus("ready");
-          }
-        }, remainingDelay);
       }
     }
     initFirebaseAndApp();
@@ -663,7 +667,7 @@
     // Send Message
     async function sendMessage() {
       const content = elements.messageInput.value.trim();
-      if (!content) return;
+      if (!content || !messagesRef || isSending) return;
 
       const isCode = isLikelyCode(content);
       const newMsg = {
@@ -698,7 +702,7 @@
         setAppStatus("error");
         isSending = false;
       } finally {
-        elements.btnSend.disabled = false;
+        elements.btnSend.disabled = !messagesRef;
         elements.messageInput.focus();
       }
     }
@@ -1076,6 +1080,7 @@
 
     function showFirebaseWarning(details) {
       if (elements.firebaseErrorAlert) {
+        document.getElementById("firebase-error-details").textContent = details;
         elements.firebaseErrorAlert.classList.remove("hidden");
         elements.firebaseErrorAlert.style.display = "block";
       }

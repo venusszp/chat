@@ -1,0 +1,11 @@
+{
+  "rules": {
+    "chat_snippets": {
+      ".read": true,
+      ".write": true,
+      "$messageId": {
+        ".validate": "newData.hasChildren(['content', 'isCode', 'author', 'timestamp']) && newData.child('content').isString() && newData.child('content').val().length > 0 && newData.child('content').val().length <= 100000 && newData.child('isCode').isBoolean() && newData.child('author').isString() && newData.child('author').val().length <= 60 && newData.child('timestamp').isNumber()"
+      }
+    }
+  }
+}
